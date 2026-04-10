@@ -2,8 +2,12 @@ from flask import Flask, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 import os
+import json
+import time
 
 from app.config import Config
+
+DEBUG_LOG_PATH = r'D:\专注度\debug-2efedb.log'
 
 
 def create_app(config_name: str = 'development') -> Flask:
@@ -13,6 +17,31 @@ def create_app(config_name: str = 'development') -> Flask:
     )
 
     CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+    # region agent log
+    def _agent_log(run_id, hypothesis_id, location, message, data):
+        with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'sessionId': '2efedb',
+                'runId': run_id,
+                'hypothesisId': hypothesis_id,
+                'location': location,
+                'message': message,
+                'data': data,
+                'timestamp': int(time.time() * 1000),
+            }, ensure_ascii=False) + '\n')
+    # endregion
+
+    @app.before_request
+    def _agent_before_request():
+        # region agent log
+        _agent_log('pre-fix', 'H3', 'app/__init__.py:before_request', 'incoming request', {
+            'method': request.method,
+            'path': request.path,
+            'remote_addr': request.remote_addr,
+            'host': request.host,
+        })
+        # endregion
 
     @app.after_request
     def after_request(response):
@@ -49,6 +78,12 @@ def create_app(config_name: str = 'development') -> Flask:
 
     @app.errorhandler(404)
     def not_found(e):
+        # region agent log
+        _agent_log('pre-fix', 'H4', 'app/__init__.py:not_found', '404 returned', {
+            'method': request.method,
+            'path': request.path,
+        })
+        # endregion
         return {'error': '资源不存在', 'code': 404}, 404
 
     @app.errorhandler(500)

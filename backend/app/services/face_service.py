@@ -4,6 +4,7 @@ import base64
 import time
 import logging
 import os
+import json
 from app.config import Config
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,10 @@ _student_reid_bank = {}
 _student_spatial_anchor = {}
 _dnn_face_net = None
 _dnn_ready = False
+_debug_log_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    'debug-24509c.log'
+)
 _calibration = {
     'min_face_area_ratio': 0.0045,
     'min_face_blur': 65.0,
@@ -110,6 +115,22 @@ _calibration_profiles = {
     },
 }
 
+
+def _debug_log(run_id, hypothesis_id, location, message, data):
+    try:
+        payload = {
+            'sessionId': '24509c',
+            'runId': run_id,
+            'hypothesisId': hypothesis_id,
+            'location': location,
+            'message': message,
+            'data': data,
+            'timestamp': int(time.time() * 1000),
+        }
+        with open(_debug_log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
 
 def _normalize_vector(vec):
     arr = np.array(vec, dtype=np.float32)
@@ -310,6 +331,16 @@ def _apply_temporal_single_person_stabilization(boxes):
     last_ts = _track_state['last_ts']
 
     if not boxes:
+        # Brief detector dropouts are common in classroom streams; keep last stable boxes
+        # for a short grace window to avoid oscillating 0/1 face results.
+        hold_window_sec = 1.05
+        if last_boxes and (now - last_ts) <= hold_window_sec:
+            _track_state['last_ts'] = now
+            _track_state['last_count'] = len(last_boxes)
+            _track_state['last_box'] = last_boxes[0] if len(last_boxes) == 1 else None
+            _track_state['last_boxes'] = last_boxes[:]
+            return last_boxes[:]
+
         _track_state['last_ts'] = now
         _track_state['last_count'] = 0
         _track_state['last_box'] = None
@@ -783,6 +814,67 @@ def _cosine_similarity(a, b):
     return float(np.dot(va, vb) / (na * nb))
 
 
+def _parse_registered_templates(known_entry):
+    """
+    Parse stored face enrollment payload from DB.
+    Supports:
+    1) Legacy CSV vector string
+    2) JSON payload with prototype + templates
+    """
+    vectors = []
+    quality_weights = []
+
+    if isinstance(known_entry, bytes):
+        try:
+            known_entry = known_entry.decode('utf-8')
+        except Exception:
+            return vectors, quality_weights
+
+    if isinstance(known_entry, str):
+        text = known_entry.strip()
+        if not text:
+            return vectors, quality_weights
+        if text.startswith('{'):
+            try:
+                payload = json.loads(text)
+                if isinstance(payload, dict):
+                    proto = payload.get('prototype')
+                    if isinstance(proto, list) and len(proto) > 0:
+                        vectors.append([float(x) for x in proto])
+                        quality_weights.append(1.0)
+                    templates = payload.get('templates')
+                    if isinstance(templates, list):
+                        for t in templates:
+                            if not isinstance(t, dict):
+                                continue
+                            vec = t.get('vector')
+                            if not isinstance(vec, list) or len(vec) == 0:
+                                continue
+                            vectors.append([float(x) for x in vec])
+                            q = t.get('quality', 0.8)
+                            quality_weights.append(max(0.2, min(1.5, float(q))))
+                    return vectors, quality_weights
+            except Exception:
+                # fallback to CSV parser
+                pass
+
+        try:
+            vec = [float(x) for x in text.split(',') if x != '']
+            if vec:
+                vectors.append(vec)
+                quality_weights.append(1.0)
+            return vectors, quality_weights
+        except Exception:
+            return vectors, quality_weights
+
+    if isinstance(known_entry, (list, np.ndarray)):
+        vec = list(known_entry)
+        if vec:
+            vectors.append([float(x) for x in vec])
+            quality_weights.append(1.0)
+    return vectors, quality_weights
+
+
 def _extract_reid_embedding(image_bgr, person_bbox, target_dim=128):
     if image_bgr is None or person_bbox is None:
         return [0.0] * target_dim
@@ -881,6 +973,28 @@ def _stabilize_identity_for_track(track_id, candidate_student, candidate_confide
             dist = ((cx - anc[0]) ** 2 + (cy - anc[1]) ** 2) ** 0.5
             if dist > float(_calibration.get('spatial_gate', 0.22)):
                 candidate_confidence *= 0.55
+    vote_conf_gate = max(
+        float(_calibration.get('min_match_confidence', 0.06)),
+        float(_calibration.get('live_face_conf_gate', 0.18))
+    )
+    candidate_confident = bool(candidate_student) and float(candidate_confidence) >= vote_conf_gate
+    # region agent log
+    _debug_log(
+        'pre-fix',
+        'H2',
+        'face_service.py:_stabilize_identity_for_track:vote_gate',
+        'identity vote gate evaluated',
+        {
+            'trackId': int(track_id) if track_id is not None else None,
+            'hasCandidate': bool(candidate_student),
+            'candidateConfidence': round(float(candidate_confidence or 0.0), 4),
+            'voteConfGate': round(float(vote_conf_gate), 4),
+            'candidateConfident': bool(candidate_confident),
+            'state': str(current_state or ''),
+        }
+    )
+    # endregion
+
     if candidate_student:
         sid = str(candidate_student.get('id', ''))
         if sid:
@@ -941,7 +1055,22 @@ def _stabilize_identity_for_track(track_id, candidate_student, candidate_confide
             _student_spatial_anchor[sid] = (cx, cy)
         else:
             _student_spatial_anchor[sid] = (old[0] * 0.86 + cx * 0.14, old[1] * 0.86 + cy * 0.14)
-    return confirmed if confirmed is not None else candidate_student
+    out_student = confirmed if confirmed is not None else candidate_student
+    # region agent log
+    _debug_log(
+        'pre-fix',
+        'H3',
+        'face_service.py:_stabilize_identity_for_track:return',
+        'identity stabilization result',
+        {
+            'trackId': int(track_id) if track_id is not None else None,
+            'confirmedExists': bool(confirmed),
+            'votesSize': len(votes),
+            'returnedStudentId': str(out_student.get('id')) if isinstance(out_student, dict) and out_student.get('id') is not None else None,
+        }
+    )
+    # endregion
+    return out_student
 
 
 def get_calibration():
@@ -1683,6 +1812,19 @@ def process_frame_for_monitoring(image_base64: str, students_data: list = None) 
                     'name': stu.get('real_name', ''),
                     'student_number': stu.get('student_number', '')
                 })
+        # region agent log
+        _debug_log(
+            'pre-fix',
+            'H1',
+            'face_service.py:process_frame_for_monitoring:known_students',
+            'known student features prepared',
+            {
+                'studentsDataCount': len(students_data),
+                'knownFeaturesCount': len(known_features_list),
+                'knownStudentsCount': len(known_students_info),
+            }
+        )
+        # endregion
         # Prevent stale cross-class identity contamination.
         if len(valid_ids) > 0:
             for sid in list(_student_reid_bank.keys()):
@@ -1789,6 +1931,22 @@ def process_frame_for_monitoring(image_base64: str, students_data: list = None) 
                     candidate_student = known_students_info[mi]
                     candidate_conf = float(recog_result.get('confidence', 0.0))
                     face_recog_id = str(candidate_student.get('id', ''))
+                    # region agent log
+                    _debug_log(
+                        'pre-fix',
+                        'H1',
+                        'face_service.py:process_frame_for_monitoring:face_recog_hit',
+                        'face recognition matched candidate',
+                        {
+                            'trackId': int(track_id) if track_id is not None else None,
+                            'matchIndex': int(mi),
+                            'knownStudentsCount': len(known_students_info),
+                            'confidence': round(candidate_conf, 4),
+                            'distance': float(recog_result.get('distance') or 0.0),
+                            'distanceMargin': float(recog_result.get('distanceMargin') or 0.0),
+                        }
+                    )
+                    # endregion
                     tr = _state_tracker['tracks'].get(track_id) if track_id is not None else None
                     if tr is not None and candidate_conf >= float(_calibration.get('live_face_conf_gate', 0.18)):
                         tr['identity_cache'] = {
@@ -1819,6 +1977,20 @@ def process_frame_for_monitoring(image_base64: str, students_data: list = None) 
                             candidate_student = info
                             candidate_conf = max(candidate_conf, float(reid_hit.get('similarity', 0.0)) * 0.6)
                             break
+                    # region agent log
+                    _debug_log(
+                        'pre-fix',
+                        'H4',
+                        'face_service.py:process_frame_for_monitoring:reid_hit',
+                        'reid matched candidate',
+                        {
+                            'trackId': int(track_id) if track_id is not None else None,
+                            'reidSimilarity': float(reid_hit.get('similarity') or 0.0),
+                            'reidMargin': float(reid_hit.get('margin') or 0.0),
+                            'candidateConfidenceAfterReid': round(float(candidate_conf or 0.0), 4),
+                        }
+                    )
+                    # endregion
                     if candidate_student is not None and tr is not None:
                         tr['identity_cache'] = {
                             'student': candidate_student,
@@ -1832,6 +2004,19 @@ def process_frame_for_monitoring(image_base64: str, students_data: list = None) 
                 and reid_id is not None
                 and face_recog_id != reid_id
             ):
+                # region agent log
+                _debug_log(
+                    'pre-fix',
+                    'H4',
+                    'face_service.py:process_frame_for_monitoring:consistency_conflict',
+                    'face/reid conflict, candidate dropped',
+                    {
+                        'trackId': int(track_id) if track_id is not None else None,
+                        'faceId': face_recog_id,
+                        'reidId': reid_id,
+                    }
+                )
+                # endregion
                 candidate_student = None
                 candidate_conf = 0.0
             student_info = _stabilize_identity_for_track(
@@ -1856,6 +2041,21 @@ def process_frame_for_monitoring(image_base64: str, students_data: list = None) 
             }
         else:
             matched_student = None
+        # region agent log
+        _debug_log(
+            'pre-fix',
+            'H5',
+            'face_service.py:process_frame_for_monitoring:result_face',
+            'final matched_student per face',
+            {
+                'trackId': int(stable.get('track_id')) if stable.get('track_id') is not None else None,
+                'isRegistered': bool(is_registered),
+                'matchedStudentId': str(matched_student.get('id')) if isinstance(matched_student, dict) and matched_student.get('id') is not None else None,
+                'attentionLevel': str(level),
+                'allowIdentityMatch': bool(allow_identity_match),
+            }
+        )
+        # endregion
 
         expression_map = {
             'looking_forward': 'neutral',
@@ -1944,35 +2144,32 @@ def recognize_face_from_features(current_features, known_features_list: list) ->
     second_distance = float('inf')
 
     for idx, known in enumerate(known_features_list):
-        if isinstance(known, bytes):
-            try:
-                known = known.decode('utf-8')
-            except Exception:
-                continue
-
-        if isinstance(known, str):
-            try:
-                known_vec = [float(x) for x in known.split(',') if x != '']
-            except ValueError:
-                continue
-        elif isinstance(known, (list, np.ndarray)):
-            known_vec = list(known)
-        else:
+        template_vectors, quality_weights = _parse_registered_templates(known)
+        if len(template_vectors) == 0:
             continue
 
-        min_len = min(len(current_features), len(known_vec))
-        dist = float(
-            np.linalg.norm(
-                np.array(current_features[:min_len]) - np.array(known_vec[:min_len])
+        cand_best = float('inf')
+        for i, known_vec in enumerate(template_vectors):
+            min_len = min(len(current_features), len(known_vec))
+            if min_len <= 0:
+                continue
+            raw_dist = float(
+                np.linalg.norm(
+                    np.array(current_features[:min_len]) - np.array(known_vec[:min_len])
+                )
             )
-        )
+            # Better templates (higher quality) get slightly stronger voting power.
+            q = quality_weights[i] if i < len(quality_weights) else 1.0
+            weighted_dist = raw_dist / max(0.75, (0.85 + 0.15 * q))
+            if weighted_dist < cand_best:
+                cand_best = weighted_dist
 
-        if dist < best_distance:
+        if cand_best < best_distance:
             second_distance = best_distance
-            best_distance = dist
+            best_distance = cand_best
             best_match = idx
-        elif dist < second_distance:
-            second_distance = dist
+        elif cand_best < second_distance:
+            second_distance = cand_best
 
     threshold = Config.FACE_RECOGNITION_THRESHOLD
     margin = second_distance - best_distance if second_distance < float('inf') else 1.0
@@ -1989,7 +2186,6 @@ def recognize_face_from_features(current_features, known_features_list: list) ->
             confidence = 0.0
     else:
         confidence = 0.0
-
     return {
         'matched': matched,
         'matchIndex': best_match if matched else -1,

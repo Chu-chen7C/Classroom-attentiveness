@@ -1,9 +1,110 @@
 from flask import Blueprint, request, jsonify
 import base64
+import json
+import cv2
+import numpy as np
 from app.database import execute_query, execute_one, execute_insert, execute_update
 from app.utils.auth import token_required, teacher_required
 
 student_bp = Blueprint('student', __name__)
+
+MAX_ENROLL_INPUT_IMAGES = 12
+MAX_ENROLL_EXPANDED_IMAGES = 28
+TEMPLATE_TARGET_COUNT = 8
+
+def _decode_base64_image(image_b64: str):
+    try:
+        payload = image_b64.split(',')[1] if ',' in image_b64 else image_b64
+        img_bytes = base64.b64decode(payload)
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return img
+    except Exception:
+        return None
+
+
+def _encode_base64_image(image_bgr):
+    ok, buf = cv2.imencode('.jpg', image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok:
+        return None
+    b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _generate_augmented_images(image_b64: str):
+    """
+    Create mild variations to improve enrollment robustness under surveillance shifts:
+    slight brightness/contrast/rotation changes only.
+    """
+    img = _decode_base64_image(image_b64)
+    if img is None or img.size == 0:
+        return [image_b64]
+
+    variants = [img]
+    h, w = img.shape[:2]
+
+    # 1) slight brightness/contrast shift
+    light = cv2.convertScaleAbs(img, alpha=1.06, beta=8)
+    dark = cv2.convertScaleAbs(img, alpha=0.94, beta=-6)
+    variants.extend([light, dark])
+
+    # 2) slight pose perturbation via tiny rotation
+    center = (w / 2.0, h / 2.0)
+    for angle in (-4.0, 4.0):
+        m = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rot = cv2.warpAffine(
+            img, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+        variants.append(rot)
+
+    outputs = []
+    for v in variants:
+        b64 = _encode_base64_image(v)
+        if b64:
+            outputs.append(b64)
+    return outputs if outputs else [image_b64]
+
+
+def _cosine_distance(a, b):
+    va = np.array(a, dtype=np.float32)
+    vb = np.array(b, dtype=np.float32)
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    if na <= 1e-8 or nb <= 1e-8:
+        return 1.0
+    sim = float(np.dot(va, vb) / (na * nb))
+    return 1.0 - sim
+
+
+def _select_diverse_templates(samples, target_count):
+    """
+    Select high-quality but diverse templates (greedy max-min diversity with quality prior).
+    """
+    if len(samples) <= target_count:
+        return samples
+
+    ranked = sorted(samples, key=lambda s: float(s.get('quality', 0.0)), reverse=True)
+    selected = [ranked[0]]
+    for candidate in ranked[1:]:
+        if len(selected) >= target_count:
+            break
+        dists = [
+            _cosine_distance(candidate['features'], kept['features'])
+            for kept in selected
+        ]
+        min_dist = min(dists) if dists else 1.0
+        # Keep templates that are not near-duplicates.
+        if min_dist >= 0.022:
+            selected.append(candidate)
+
+    if len(selected) < target_count:
+        for candidate in ranked:
+            if len(selected) >= target_count:
+                break
+            if candidate in selected:
+                continue
+            selected.append(candidate)
+    return selected
 
 
 @student_bp.route('', methods=['GET'])
@@ -142,6 +243,7 @@ def register_face():
         images = [x for x in face_images if isinstance(x, str) and x.strip()]
     elif isinstance(face_image_base64, str) and face_image_base64.strip():
         images = [face_image_base64]
+    images = images[:MAX_ENROLL_INPUT_IMAGES]
     if len(images) == 0:
         return jsonify({'error': '无有效图像数据', 'code': 400}), 400
 
@@ -152,9 +254,16 @@ def register_face():
         return jsonify({'error': '学生不存在', 'code': 404}), 404
 
     from app.services.face_service import extract_face_features_with_meta
+    expanded_images = []
+    for img in images:
+        expanded_images.extend(_generate_augmented_images(img))
+        if len(expanded_images) >= MAX_ENROLL_EXPANDED_IMAGES:
+            break
+    expanded_images = expanded_images[:MAX_ENROLL_EXPANDED_IMAGES]
+
     samples = []
     rejected = 0
-    for img in images[:8]:
+    for img in expanded_images:
         meta = extract_face_features_with_meta(img)
         if not meta.get('features'):
             rejected += 1
@@ -168,21 +277,41 @@ def register_face():
     if len(samples) == 0:
         return jsonify({'error': '未检测到有效人脸，请确保面部清晰、正对摄像头、光线充足', 'code': 400}), 400
 
-    # Prefer high-quality samples and average for robust enrollment.
+    # Prefer high-quality + diverse templates for stronger cross-scene recognition.
     samples.sort(key=lambda s: s['quality'], reverse=True)
-    top_samples = samples[:min(5, len(samples))]
+    top_samples = samples[:min(16, len(samples))]
     valid_samples = [s for s in top_samples if s['ok']]
     if len(valid_samples) == 0:
-        valid_samples = top_samples[:min(2, len(top_samples))]
+        valid_samples = top_samples[:min(4, len(top_samples))]
+    valid_samples = _select_diverse_templates(valid_samples, TEMPLATE_TARGET_COUNT)
 
-    import numpy as np
     feat_arr = np.array([s['features'] for s in valid_samples], dtype=np.float32)
     features = np.mean(feat_arr, axis=0).tolist()
     norm = float(np.linalg.norm(np.array(features)))
     if norm > 1e-8:
         features = (np.array(features) / norm).tolist()
 
-    features_bytes = ','.join(map(str, features)).encode('utf-8')
+    template_payload = {
+        'version': 2,
+        'method': 'multi_template_enroll',
+        'prototype': [round(float(x), 6) for x in features],
+        'templates': [
+            {
+                'vector': [round(float(v), 6) for v in s['features']],
+                'quality': round(float(s.get('quality', 0.0)), 4)
+            }
+            for s in valid_samples
+        ],
+        'quality': {
+            'sampleCount': len(valid_samples),
+            'rejectedSamples': rejected,
+            'inputImageCount': len(images),
+            'expandedImageCount': len(expanded_images),
+            'avgSampleQuality': round(float(np.mean([s.get('quality', 0.0) for s in valid_samples])), 4),
+            'bestSampleQuality': round(float(max([s.get('quality', 0.0) for s in valid_samples])), 4),
+        }
+    }
+    features_bytes = json.dumps(template_payload, ensure_ascii=False).encode('utf-8')
 
     image_path = f"/uploads/faces/{student_id}_{__import__('datetime').datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
 
@@ -199,7 +328,9 @@ def register_face():
         'features': features[:10],
         'featureCount': len(features),
         'sampleCount': len(valid_samples),
-        'rejectedSamples': rejected
+        'rejectedSamples': rejected,
+        'templateCount': len(valid_samples),
+        'expandedImageCount': len(expanded_images),
     })
 
 

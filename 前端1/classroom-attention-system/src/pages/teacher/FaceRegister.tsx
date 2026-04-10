@@ -55,6 +55,9 @@ const CAPTURE_QUALITY = 0.95
 const DETECT_INTERVAL_MS = 400
 const PROGRESS_INCREMENT = 20
 const PROGRESS_DECREMENT = 3
+const MIN_ENROLL_SAMPLES = 4
+const BURST_CAPTURE_COUNT = 5
+const BURST_CAPTURE_INTERVAL_MS = 140
 
 const FaceRegister = () => {
   const [classes, setClasses] = useState<ClassOption[]>([])
@@ -91,10 +94,15 @@ const FaceRegister = () => {
   const detectTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const actionDoneRef = useRef(actionDone)
+  const isCapturingRef = useRef(false)
 
   useEffect(() => {
     actionDoneRef.current = actionDone
   }, [actionDone])
+
+  useEffect(() => {
+    isCapturingRef.current = isCapturing
+  }, [isCapturing])
 
   const addCaptureSample = useCallback((img: string) => {
     if (!img || img.length < 1000) return
@@ -363,12 +371,11 @@ const FaceRegister = () => {
     await waitForVideoReady()
 
     setDetectStatus('正在检测人脸...')
-
     let detectAttemptCount = 0
     const MAX_DETECT_ATTEMPTS = 3
 
     detectTimerRef.current = setInterval(async () => {
-      if (!videoRef.current || !canvasRef.current || !isCapturing) return
+      if (!videoRef.current || !canvasRef.current || !isCapturingRef.current) return
 
       const video = videoRef.current
       const canvas = canvasRef.current
@@ -462,15 +469,54 @@ const FaceRegister = () => {
     }, DETECT_INTERVAL_MS)
   }
 
-  const handleAutoCapture = () => {
+  const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const captureFrame = useCallback((): string | null => {
+    if (!videoRef.current || !canvasRef.current) return null
+    const video = videoRef.current
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+
+    const vw = video.videoWidth || 640
+    const vh = video.videoHeight || 480
+    canvas.width = vw
+    canvas.height = vh
+    ctx.drawImage(video, 0, 0, vw, vh)
+
+    const imageData = canvas.toDataURL('image/jpeg', CAPTURE_QUALITY)
+    if (!imageData || imageData.length < 1000) return null
+    return imageData
+  }, [])
+
+  const captureBurstSamples = useCallback(async (count: number) => {
+    const imgs: string[] = []
+    for (let i = 0; i < count; i++) {
+      const img = captureFrame()
+      if (img) {
+        imgs.push(img)
+      }
+      if (i < count - 1) {
+        await waitMs(BURST_CAPTURE_INTERVAL_MS)
+      }
+    }
+    if (imgs.length > 0) {
+      imgs.forEach((img) => addCaptureSample(img))
+      setCapturedImage((prev) => prev || imgs[0])
+      setDetectStatus(`已连续采样 ${imgs.length} 帧`)
+    }
+    return imgs
+  }, [addCaptureSample, captureFrame])
+
+  const handleAutoCapture = async () => {
     if (detectTimerRef.current) {
       clearInterval(detectTimerRef.current)
       detectTimerRef.current = null
     }
-    handleCapture()
+    await handleCapture()
   }
 
-  const handleCapture = () => {
+  const handleCapture = async () => {
     if (detectTimerRef.current) {
       clearInterval(detectTimerRef.current)
       detectTimerRef.current = null
@@ -480,26 +526,21 @@ const FaceRegister = () => {
       return
     }
 
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    const first = captureFrame()
+    if (!first) {
+      message.error('拍摄失败，请保持画面稳定后重试')
+      return
+    }
 
-    const vw = video.videoWidth || 640
-    const vh = video.videoHeight || 480
-    canvas.width = vw
-    canvas.height = vh
-    ctx.drawImage(video, 0, 0, vw, vh)
+    addCaptureSample(first)
+    setCapturedImage(first)
+    const extra = await captureBurstSamples(BURST_CAPTURE_COUNT - 1)
+    console.log(`[FaceReg] 连拍完成: 首帧+额外${extra.length}帧`)
 
-    const imageData = canvas.toDataURL('image/jpeg', CAPTURE_QUALITY)
-    console.log(`[FaceReg] 拍摄完成: 尺寸=${vw}x${vh}, 数据大小=${imageData.length} bytes`)
-
-    setCapturedImage(imageData)
-    addCaptureSample(imageData)
     stopCamera()
     setIsCapturing(false)
     setCurrentStep(2)
-    setDetectStatus('照片已捕获')
+    setDetectStatus('照片已捕获并完成多帧采样')
   }
 
   const handleSave = async () => {
@@ -507,6 +548,12 @@ const FaceRegister = () => {
       message.warning('请先拍摄照片')
       return
     }
+
+    if (capturedSamples.length < MIN_ENROLL_SAMPLES) {
+      message.warning(`当前仅采样 ${capturedSamples.length} 张，建议至少 ${MIN_ENROLL_SAMPLES} 张后再保存，以提高识别准确率`)
+      return
+    }
+
     setSaving(true)
 
     try {
@@ -514,15 +561,14 @@ const FaceRegister = () => {
       console.log(`[FaceReg] 学生: ${selectedStudent.name} (ID: ${selectedStudent.id})`)
       console.log(`[FaceReg] 图片大小: ${capturedImage.length} bytes`)
       console.log(`[FaceReg] Token: ${localStorage.getItem('token')?.substring(0, 25)}...`)
-
-      const images = [...capturedSamples, capturedImage].filter(Boolean).slice(0, 6)
+      const images = Array.from(new Set([...capturedSamples, capturedImage].filter(Boolean))).slice(0, 8)
       const result = await registerFace(selectedStudent.id, images.length > 1 ? images : capturedImage)
 
       console.log(`[FaceReg] ===== 注册成功 =====`)
       console.log(`[FaceReg] 响应:`, result)
 
       message.success(
-        `${selectedStudent.name} 的人脸录入成功！特征维度 ${result.featureCount}，有效样本 ${result.sampleCount ?? images.length}`,
+        `${selectedStudent.name} 的人脸录入成功！特征维度 ${result.featureCount}，模板 ${result.templateCount ?? result.sampleCount ?? images.length} 组`,
         5
       )
 

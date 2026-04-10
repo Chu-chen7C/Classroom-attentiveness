@@ -1,4 +1,7 @@
 from flask import Blueprint, request, jsonify
+import os
+import json
+import time
 from app.services.face_service import (
     detect_faces,
     extract_face_features,
@@ -11,6 +14,50 @@ from app.services.face_service import (
 from app.database import execute_query, execute_one
 
 face_bp = Blueprint('face', __name__)
+
+_debug_log_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    'debug-24509c.log'
+)
+_debug_log_path_41bf64 = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    'debug-41bf64.log'
+)
+_last_monitor_request_ms_41bf64 = None
+
+
+def _debug_log(run_id, hypothesis_id, location, message, data):
+    try:
+        payload = {
+            'sessionId': '24509c',
+            'runId': run_id,
+            'hypothesisId': hypothesis_id,
+            'location': location,
+            'message': message,
+            'data': data,
+            'timestamp': int(time.time() * 1000),
+        }
+        with open(_debug_log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def _debug_log_41bf64(run_id, hypothesis_id, location, message, data):
+    try:
+        payload = {
+            'sessionId': '41bf64',
+            'runId': run_id,
+            'hypothesisId': hypothesis_id,
+            'location': location,
+            'message': message,
+            'data': data,
+            'timestamp': int(time.time() * 1000),
+        }
+        with open(_debug_log_path_41bf64, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
 
 
 @face_bp.route('/detect', methods=['POST'])
@@ -88,9 +135,40 @@ def recognize():
 
 @face_bp.route('/monitoring/analyze', methods=['POST'])
 def monitoring_analyze():
+    global _last_monitor_request_ms_41bf64
     data = request.get_json()
     image_base64 = data.get('image')
     classroom_id = data.get('classroomId')
+    now_ms = int(time.time() * 1000)
+    delta_since_last = None if _last_monitor_request_ms_41bf64 is None else (now_ms - _last_monitor_request_ms_41bf64)
+    _last_monitor_request_ms_41bf64 = now_ms
+    # region agent log
+    _debug_log_41bf64(
+        'pre-fix',
+        'H7',
+        'face.py:monitoring_analyze:arrival',
+        'monitoring request arrived',
+        {
+            'deltaSinceLastRequestMs': delta_since_last,
+            'hasImage': bool(image_base64),
+            'classroomIdPresent': classroom_id is not None,
+            'imageSize': len(image_base64) if isinstance(image_base64, str) else 0,
+        }
+    )
+    # endregion
+    # region agent log
+    _debug_log(
+        'pre-fix',
+        'H6',
+        'face.py:monitoring_analyze:entry',
+        'monitoring analyze route entered',
+        {
+            'hasImage': bool(image_base64),
+            'classroomIdPresent': classroom_id is not None,
+            'imageSize': len(image_base64) if isinstance(image_base64, str) else 0,
+        }
+    )
+    # endregion
 
     if not image_base64:
         return jsonify({'error': '缺少图像数据', 'code': 400}), 400
@@ -106,7 +184,35 @@ def monitoring_analyze():
         )
 
     students_data = [dict(s) for s in students]
+    # region agent log
+    _debug_log(
+        'pre-fix',
+        'H6',
+        'face.py:monitoring_analyze:before_process',
+        'calling process_frame_for_monitoring',
+        {
+            'studentsCount': len(students_data),
+            'classroomId': str(classroom_id) if classroom_id is not None else None,
+        }
+    )
+    # endregion
+    process_start_ms = int(time.time() * 1000)
     result = process_frame_for_monitoring(image_base64, students_data)
+    process_elapsed_ms = int(time.time() * 1000) - process_start_ms
+    # region agent log
+    _debug_log_41bf64(
+        'pre-fix',
+        'H8',
+        'face.py:monitoring_analyze:after_process',
+        'monitoring processed',
+        {
+            'processElapsedMs': process_elapsed_ms,
+            'studentsCount': len(students_data),
+            'resultFaces': int(result.get('totalFaces', 0)) if isinstance(result, dict) else None,
+            'resultHasError': bool(isinstance(result, dict) and result.get('error')),
+        }
+    )
+    # endregion
 
     return jsonify(result)
 
@@ -152,6 +258,7 @@ def health_check():
         _fs._init_cascades()
     return jsonify({
         'status': 'ok',
+        'debugSessionMarker': '24509c-face-route',
         'cascade_initialized': _fs._init_status,
         'cascades': {
             'face': _fs._cascade_face is not None,

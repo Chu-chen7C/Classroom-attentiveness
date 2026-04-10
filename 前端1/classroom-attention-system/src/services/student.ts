@@ -41,6 +41,7 @@ export async function registerFace(studentId: string, image: string | string[]):
     featureCount: number
     sampleCount?: number
     rejectedSamples?: number
+    templateCount?: number
 }> {
     if (Array.isArray(image)) {
         return api.post('/students/face/register', { studentId, images: image })

@@ -52,8 +52,8 @@ interface LightRaysProps {
 interface Uniforms {
   iTime: { value: number };
   iResolution: { value: [number, number] };
-  rayPos: { value: [number, number] };
-  rayDir: { value: [number, number] };
+  rayPos: { value: number[] };
+  rayDir: { value: number[] };
   raysColor: { value: [number, number, number] };
   raysSpeed: { value: number };
   lightSpread: { value: number };
@@ -61,7 +61,7 @@ interface Uniforms {
   pulsating: { value: number };
   fadeDistance: { value: number };
   saturation: { value: number };
-  mousePos: { value: [number, number] };
+  mousePos: { value: number[] };
   mouseInfluence: { value: number };
   noiseAmount: { value: number };
   distortion: { value: number };

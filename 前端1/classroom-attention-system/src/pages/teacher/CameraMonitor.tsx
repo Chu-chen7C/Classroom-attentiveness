@@ -236,16 +236,32 @@ const CameraMonitor = () => {
   const monitorSessionRef = useRef(0)
   const requestAbortRef = useRef<AbortController | null>(null)
   const lastStatusChangeRef = useRef(0)
+  const lastTickAtRef = useRef<number | null>(null)
+  const debugTickCountRef = useRef(0)
 
   useEffect(() => {
+    // #region agent log
+    fetch('http://127.0.0.1:7687/ingest/5c8881f3-0bc5-4921-be4d-f1e8b45516c1',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'41bf64'},body:JSON.stringify({sessionId:'41bf64',runId:'pre-fix',hypothesisId:'H1',location:'CameraMonitor.tsx:241',message:'detectionInterval state changed',data:{detectionInterval},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     isMonitoringRef.current = isMonitoring
   }, [isMonitoring])
+
+  useEffect(() => {
+    // #region agent log
+    fetch('http://127.0.0.1:7687/ingest/5c8881f3-0bc5-4921-be4d-f1e8b45516c1',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'41bf64'},body:JSON.stringify({sessionId:'41bf64',runId:'pre-fix',hypothesisId:'H1',location:'CameraMonitor.tsx:248',message:'detectionInterval value observed',data:{detectionInterval},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }, [detectionInterval])
 
   useEffect(() => {
     if (!isMonitoring) return
     if (timerRef.current) {
       clearInterval(timerRef.current)
     }
+    lastTickAtRef.current = null
+    debugTickCountRef.current = 0
+    // #region agent log
+    fetch('http://127.0.0.1:7687/ingest/5c8881f3-0bc5-4921-be4d-f1e8b45516c1',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'41bf64'},body:JSON.stringify({sessionId:'41bf64',runId:'pre-fix',hypothesisId:'H4',location:'CameraMonitor.tsx:258',message:'interval timer created',data:{detectionInterval,isMonitoring},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     timerRef.current = window.setInterval(() => {
       sendFrameToBackend()
     }, detectionInterval)
@@ -608,8 +624,21 @@ const CameraMonitor = () => {
     // Avoid stale-closure bug: `isMonitoring` state inside interval callback
     // can be outdated. Interval is cleared in `stopMonitoring`, so we only
     // need to guard against concurrent requests via `detecting`.
+    const now = Date.now()
+    const last = lastTickAtRef.current
+    const deltaMs = last ? now - last : null
+    lastTickAtRef.current = now
+    if (debugTickCountRef.current < 30) {
+      // #region agent log
+      fetch('http://127.0.0.1:7687/ingest/5c8881f3-0bc5-4921-be4d-f1e8b45516c1',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'41bf64'},body:JSON.stringify({sessionId:'41bf64',runId:'pre-fix',hypothesisId:'H2',location:'CameraMonitor.tsx:623',message:'sendFrameToBackend tick',data:{deltaMs,detectionInterval,isMonitoringRef:isMonitoringRef.current,detecting,requestInFlight:requestInFlightRef.current,useLocalDetection},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      debugTickCountRef.current += 1
+    }
     if (!isMonitoringRef.current || detecting) return
     if (requestInFlightRef.current) {
+      // #region agent log
+      fetch('http://127.0.0.1:7687/ingest/5c8881f3-0bc5-4921-be4d-f1e8b45516c1',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'41bf64'},body:JSON.stringify({sessionId:'41bf64',runId:'pre-fix',hypothesisId:'H3',location:'CameraMonitor.tsx:629',message:'tick skipped because request in flight',data:{detectionInterval,useLocalDetection},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       pendingSendRef.current = true
       return
     }
